@@ -147,6 +147,322 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(r.to_json()["results"], ["17/6"])
 
 
+def timed_payload(**over):
+    payload = {
+        "source": "A",
+        "target": "C",
+        "relations": [
+            # Era 1 (Jan 1st): A->B = 2x+1, hence A->C = x + 5/6
+            {
+                "from": "A", "to": "B", "a": "2", "b": "1",
+                "validFrom": "2026-01-01T00:00:00Z",
+                "validUntil": "2026-01-02T00:00:00Z",
+            },
+            # Era 2 (from Jan 2nd, unbounded): A->B = 3x, hence A->C = 3/2 x + 1/3
+            {
+                "from": "A", "to": "B", "a": "3", "b": "0",
+                "validFrom": "2026-01-02T00:00:00Z",
+            },
+            # B->C always in force.
+            {"from": "B", "to": "C", "a": "1/2", "b": "1/3"},
+        ],
+        "timedReadings": [
+            {"value": "1", "observedAt": "2026-01-01T00:00:00Z"},
+            {"value": "1", "observedAt": "2026-01-02T00:00:00Z"},
+        ],
+    }
+    payload.update(over)
+    return payload
+
+
+class TimedTranslationTests(unittest.TestCase):
+    def test_uses_relations_valid_at_each_instant(self):
+        r = cal.translate(timed_payload())
+        body = r.to_json()
+        self.assertEqual(
+            body["timedReadings"],
+            [
+                {
+                    "value": "1",
+                    "observedAt": "2026-01-01T00:00:00Z",
+                    "coefficient": "1",
+                    "result": "11/6",
+                },
+                {
+                    "value": "1",
+                    "observedAt": "2026-01-02T00:00:00Z",
+                    "coefficient": "3/2",
+                    "result": "11/6",
+                },
+            ],
+        )
+        # No legacy fields leak into a timed response.
+        self.assertNotIn("coefficients", body)
+        self.assertNotIn("results", body)
+        self.assertNotIn("readings", body)
+
+    def test_half_open_interval_boundaries(self):
+        # validUntil is exclusive: exactly at 2026-01-02T00:00:00Z era 1 is
+        # already gone; validFrom is inclusive, so era 2 starts then.
+        payload = timed_payload(
+            timedReadings=[
+                {"value": "0", "observedAt": "2026-01-01T23:59:59.999999Z"},
+                {"value": "0", "observedAt": "2026-01-02T00:00:00Z"},
+            ]
+        )
+        body = cal.translate(payload).to_json()
+        self.assertEqual(body["timedReadings"][0]["coefficient"], "1")
+        self.assertEqual(body["timedReadings"][1]["coefficient"], "3/2")
+
+    def test_order_preserved_and_offset_normalised_to_utc(self):
+        payload = timed_payload(
+            timedReadings=[
+                {"value": "2", "observedAt": "2026-01-02T08:00:00+08:00"},
+                {"value": "2", "observedAt": "2026-01-01T01:00:00+01:00"},
+            ]
+        )
+        body = cal.translate(payload).to_json()
+        self.assertEqual(
+            [item["observedAt"] for item in body["timedReadings"]],
+            ["2026-01-02T00:00:00Z", "2026-01-01T00:00:00Z"],
+        )
+        self.assertEqual(
+            [item["result"] for item in body["timedReadings"]],
+            ["10/3", "17/6"],
+        )
+
+    def test_unbounded_validity_ends(self):
+        # Relation only bounded at one end each.
+        payload = {
+            "source": "A", "target": "B",
+            "relations": [
+                {"from": "A", "to": "B", "a": "2", "b": "0",
+                 "validUntil": "2026-01-01T00:00:00Z"},
+                {"from": "A", "to": "B", "a": "3", "b": "0",
+                 "validFrom": "2026-01-01T00:00:00Z"},
+            ],
+            "timedReadings": [
+                {"value": "1", "observedAt": "2025-12-31T23:59:59Z"},
+                {"value": "1", "observedAt": "2026-01-01T00:00:00Z"},
+            ],
+        }
+        body = cal.translate(payload).to_json()
+        self.assertEqual(
+            [item["result"] for item in body["timedReadings"]], ["2", "3"]
+        )
+
+    def test_no_valid_path_at_instant_is_item_error(self):
+        payload = timed_payload(
+            timedReadings=[
+                {"value": "1", "observedAt": "2026-01-01T00:00:00Z"},  # fine
+                {"value": "1", "observedAt": "2025-12-31T23:59:59Z"},  # no A->B yet
+            ]
+        )
+        with self.assertRaises(cal.TimedUnreachable) as ctx:
+            cal.translate(payload)
+        self.assertEqual(ctx.exception.code, "unreachable")
+        self.assertEqual(ctx.exception.status, 404)
+        self.assertEqual(ctx.exception.index, 1)
+        self.assertEqual(ctx.exception.observed_at, "2025-12-31T23:59:59Z")
+
+    def test_conflict_valid_only_at_instant_is_item_error(self):
+        relations = [
+            {"from": "A", "to": "B", "a": "2", "b": "1",
+             "validFrom": "2026-01-01T00:00:00Z"},
+            {"from": "B", "to": "C", "a": "3", "b": "0",
+             "validFrom": "2026-01-01T00:00:00Z"},
+            # Contradicts the path (would require b = -1/2) only on Jan 2nd.
+            {"from": "C", "to": "A", "a": "1/6", "b": "0",
+             "validFrom": "2026-01-02T00:00:00Z",
+             "validUntil": "2026-01-03T00:00:00Z"},
+        ]
+        payload = timed_payload(
+            relations=relations,
+            timedReadings=[
+                {"value": "7/3", "observedAt": "2026-01-01T00:00:00Z"},
+                {"value": "7/3", "observedAt": "2026-01-02T12:00:00Z"},
+                {"value": "7/3", "observedAt": "2026-01-03T00:00:00Z"},
+            ],
+        )
+        with self.assertRaises(cal.TimedConflict) as ctx:
+            cal.translate(payload)
+        self.assertEqual(ctx.exception.code, "conflict")
+        self.assertEqual(ctx.exception.status, 409)
+        self.assertEqual(ctx.exception.index, 1)
+        self.assertEqual(ctx.exception.observed_at, "2026-01-02T12:00:00Z")
+        self.assertEqual(set(ctx.exception.cycle), {"A", "B", "C"})
+
+        # Outside the contradictory edge's window the graph is fine.
+        payload["timedReadings"] = [
+            {"value": "7/3", "observedAt": "2026-01-01T00:00:00Z"},
+            {"value": "7/3", "observedAt": "2026-01-03T00:00:00Z"},
+        ]
+        body = cal.translate(payload).to_json()
+        self.assertEqual(
+            [item["result"] for item in body["timedReadings"]], ["17", "17"]
+        )
+
+    def test_batch_is_atomic_no_partial_results(self):
+        payload = timed_payload(
+            timedReadings=[
+                {"value": "1", "observedAt": "2026-01-01T00:00:00Z"},
+                {"value": "1", "observedAt": "2026-01-05T00:00:00Z"},
+                {"value": "1", "observedAt": "2025-01-01T00:00:00Z"},
+            ]
+        )
+        with self.assertRaises(cal.TimedItemError):
+            cal.translate(payload)
+
+    def test_mutually_exclusive_with_readings(self):
+        with self.assertRaises(cal.InvalidRequest):
+            cal.translate(timed_payload(readings=["1"]))
+
+    def test_timed_batch_limits_and_shape(self):
+        ok_item = {"value": "0", "observedAt": "2026-01-01T00:00:00Z"}
+        cal.translate(timed_payload(timedReadings=[ok_item] * 100))
+        with self.assertRaises(cal.InvalidRequest):
+            cal.translate(timed_payload(timedReadings=[ok_item] * 101))
+        with self.assertRaises(cal.InvalidRequest):
+            cal.translate(timed_payload(timedReadings=[]))
+        with self.assertRaises(cal.InvalidRequest):
+            cal.translate(timed_payload(timedReadings=[{"observedAt": "2026-01-01T00:00:00Z"}]))
+        with self.assertRaises(cal.InvalidRequest):
+            cal.translate(timed_payload(timedReadings=[{"value": "1"}]))
+        with self.assertRaises(cal.InvalidRequest):
+            cal.translate(timed_payload(timedReadings=[{"value": "1", "observedAt": "nope"}]))
+        with self.assertRaises(cal.InvalidRequest):
+            cal.translate(
+                timed_payload(timedReadings=[{"value": 1.5, "observedAt": "2026-01-01T00:00:00Z"}])
+            )
+
+    def test_timestamps_must_be_rfc3339_with_offset(self):
+        for bad in [
+            "2026-01-01T00:00:00",
+            "2026-01-01 00:00:00Z",
+            "01-01-2026T00:00:00Z",
+            "2026-13-01T00:00:00Z",
+            "2026-01-01T00:00:00.1234567Z",
+        ]:
+            with self.assertRaises(cal.InvalidRequest):
+                cal.parse_utc(bad, "t")
+
+    def test_validity_window_must_be_ordered(self):
+        rel = {
+            "from": "A", "to": "B", "a": "1", "b": "0",
+            "validFrom": "2026-01-02T00:00:00Z",
+            "validUntil": "2026-01-01T00:00:00Z",
+        }
+        with self.assertRaises(cal.InvalidRequest):
+            cal.translate(timed_payload(relations=[rel]))
+        rel["validFrom"] = "2026-01-01T00:00:00Z"  # equal ends also rejected
+        with self.assertRaises(cal.InvalidRequest):
+            cal.translate(timed_payload(relations=[rel]))
+
+    def test_legacy_request_ignores_validity_windows(self):
+        # A relation only valid in the future must still be used by a
+        # classic readings request exactly as before.
+        payload = {
+            "source": "A", "target": "B",
+            "relations": [
+                {"from": "A", "to": "B", "a": "2", "b": "1",
+                 "validFrom": "2030-01-01T00:00:00Z"}
+            ],
+            "readings": ["1"],
+        }
+        body = cal.translate(payload).to_json()
+        self.assertEqual(body["coefficients"], {"a": "2", "b": "1"})
+        self.assertEqual(body["results"], ["3"])
+
+
+class TimedHttpSmokeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), CalibrationHandler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+
+    def _post(self, payload):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/calibrations/translate",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read())
+
+    def test_timed_translation_over_http(self):
+        status, body = self._post(timed_payload())
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body["timedReadings"],
+            [
+                {"value": "1", "observedAt": "2026-01-01T00:00:00Z",
+                 "coefficient": "1", "result": "11/6"},
+                {"value": "1", "observedAt": "2026-01-02T00:00:00Z",
+                 "coefficient": "3/2", "result": "11/6"},
+            ],
+        )
+
+    def test_timed_unreachable_reports_index_and_observed_at(self):
+        status, body = self._post(
+            timed_payload(
+                timedReadings=[
+                    {"value": "1", "observedAt": "2026-01-01T00:00:00Z"},
+                    {"value": "1", "observedAt": "2024-01-01T00:00:00Z"},
+                ]
+            )
+        )
+        self.assertEqual(status, 404)
+        error = body["error"]
+        self.assertEqual(error["code"], "unreachable")
+        self.assertEqual(error["index"], 1)
+        self.assertEqual(error["observedAt"], "2024-01-01T00:00:00Z")
+        self.assertNotIn("timedReadings", body)
+
+    def test_timed_conflict_reports_index_and_observed_at(self):
+        relations = [
+            {"from": "A", "to": "B", "a": "2", "b": "1",
+             "validFrom": "2026-01-01T00:00:00Z"},
+            {"from": "B", "to": "C", "a": "3", "b": "0",
+             "validFrom": "2026-01-01T00:00:00Z"},
+            {"from": "C", "to": "A", "a": "1/6", "b": "0",
+             "validFrom": "2026-01-02T00:00:00Z",
+             "validUntil": "2026-01-03T00:00:00Z"},
+        ]
+        status, body = self._post(
+            timed_payload(
+                relations=relations,
+                timedReadings=[
+                    {"value": "1", "observedAt": "2026-01-02T00:00:00Z"},
+                ],
+            )
+        )
+        self.assertEqual(status, 409)
+        error = body["error"]
+        self.assertEqual(error["code"], "conflict")
+        self.assertEqual(error["index"], 0)
+        self.assertEqual(error["observedAt"], "2026-01-02T00:00:00Z")
+        self.assertEqual(set(error["cycle"]), {"A", "B", "C"})
+
+    def test_both_readings_fields_rejected(self):
+        payload = timed_payload()
+        payload["readings"] = ["1"]
+        status, body = self._post(payload)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "invalid_request")
+
+
 class HttpSmokeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

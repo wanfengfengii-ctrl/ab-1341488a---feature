@@ -13,7 +13,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from .calibration import CalibrationError, translate
+from .calibration import CalibrationError, TimedItemError, translate
 
 DEFAULT_PORT = 8000
 MAX_BODY_BYTES = 1_000_000
@@ -77,6 +77,18 @@ class CalibrationHandler(BaseHTTPRequestHandler):
 
         try:
             result = translate(payload)
+        except TimedItemError as exc:
+            error = {
+                "code": exc.code,
+                "message": str(exc),
+                "index": exc.index,
+                "observedAt": exc.observed_at,
+            }
+            cycle = getattr(exc, "cycle", None)
+            if cycle is not None:
+                error["cycle"] = cycle
+            self._send_json(exc.status, {"error": error})
+            return
         except CalibrationError as exc:
             error: dict[str, Any] = {"code": exc.code, "message": str(exc)}
             if exc.code == "conflict":
