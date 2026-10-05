@@ -8,11 +8,21 @@ Every coefficient is kept as :class:`fractions.Fraction`, so no floating
 point rounding can mask a contradiction: all paths between two instruments
 must induce *exactly* the same affine transform, otherwise the request is
 rejected as a conflict.
+
+Relations may carry an optional validity window (``validFrom``/``validUntil``,
+half-open ``[validFrom, validUntil)``, either end omitted means unbounded).
+Windows only take effect for ``timedReadings`` requests: each timed reading
+is replayed against exactly the relations in force at its ``observedAt``
+moment, so historical readings are never converted with relations that were
+not yet (or no longer) active.  Plain ``readings`` requests ignore validity
+windows entirely and behave exactly as before.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from fractions import Fraction
 from typing import Iterable, Mapping, Sequence
 
@@ -21,6 +31,7 @@ MIN_INSTRUMENTS = 2
 MAX_INSTRUMENTS = 50
 MAX_RELATIONS = 100
 MAX_READINGS = 10_000
+MAX_TIMED_READINGS = 100
 
 
 class CalibrationError(Exception):
@@ -38,27 +49,56 @@ class InvalidRequest(CalibrationError):
 
 
 class Unreachable(CalibrationError):
-    """Source and target lie in different connected components."""
+    """Source and target lie in different connected components.
+
+    For timed requests this means no valid path existed at that reading's
+    moment; ``index``/``observed_at`` then locate the failing entry.
+    """
 
     code = "unreachable"
     status = 404
 
-    def __init__(self, source: str, target: str) -> None:
-        super().__init__(f"no calibration path connects {source!r} to {target!r}")
+    def __init__(
+        self,
+        source: str,
+        target: str,
+        *,
+        index: int | None = None,
+        observed_at: str | None = None,
+    ) -> None:
+        message = f"no calibration path connects {source!r} to {target!r}"
+        if index is not None:
+            message += f" at {observed_at} (timedReadings[{index}])"
+        super().__init__(message)
         self.source = source
         self.target = target
+        self.index = index
+        self.observed_at = observed_at
 
 
 class CalibrationConflict(CalibrationError):
-    """A cycle induces two different exact transforms."""
+    """A cycle induces two different exact transforms.
+
+    For timed requests only the relations in force at the failing moment
+    take part; ``index``/``observed_at`` then locate the failing entry.
+    """
 
     code = "conflict"
     status = 409
 
-    def __init__(self, cycle: Sequence[str], detail: str) -> None:
+    def __init__(
+        self,
+        cycle: Sequence[str],
+        detail: str,
+        *,
+        index: int | None = None,
+        observed_at: str | None = None,
+    ) -> None:
         super().__init__(detail)
         self.cycle = list(cycle)
         self.detail = detail
+        self.index = index
+        self.observed_at = observed_at
 
 
 @dataclass(frozen=True)
@@ -90,9 +130,19 @@ class Relation:
     to: str
     a: Fraction
     b: Fraction
+    valid_from: datetime | None = None
+    valid_until: datetime | None = None
 
     def as_adjacency(self) -> tuple[str, str, Affine]:
         return self.frm, self.to, Affine(self.a, self.b)
+
+    def is_active_at(self, moment: datetime) -> bool:
+        """Half-open window ``[validFrom, validUntil)``; open ends are unbounded."""
+        if self.valid_from is not None and moment < self.valid_from:
+            return False
+        if self.valid_until is not None and moment >= self.valid_until:
+            return False
+        return True
 
 
 def parse_rational(value: object, field_name: str) -> Fraction:
@@ -143,6 +193,40 @@ def render_fraction(value: Fraction) -> str:
     return f"{value.numerator}/{value.denominator}"
 
 
+_RFC3339_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$"
+)
+_ZERO_OFFSETS = ("+00:00", "-00:00")
+
+
+def parse_timestamp(value: object, field_name: str) -> datetime:
+    """Parse an RFC3339 timestamp that must be expressed in UTC.
+
+    Accepts ``Z``/``z`` or an explicit zero offset (``+00:00``/``-00:00``);
+    any other offset is rejected so that moments are never silently shifted
+    across validity windows by a timezone conversion.
+    """
+    if not isinstance(value, str):
+        raise InvalidRequest(
+            f"{field_name} must be an RFC3339 UTC timestamp string, "
+            f"got {type(value).__name__}"
+        )
+    text = value.strip()
+    if not _RFC3339_RE.match(text):
+        raise InvalidRequest(
+            f"{field_name}={value!r} is not a valid RFC3339 timestamp "
+            "(expected e.g. 2024-01-31T12:30:00Z)"
+        )
+    if text[-1] not in "Zz" and text[-6:] not in _ZERO_OFFSETS:
+        raise InvalidRequest(
+            f"{field_name}={value!r} must be expressed in UTC (Z or +00:00)"
+        )
+    try:
+        return datetime.fromisoformat(text.upper().replace("Z", "+00:00"))
+    except ValueError:
+        raise InvalidRequest(f"{field_name}={value!r} is not a valid calendar date/time")
+
+
 def _require_str(value: object, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise InvalidRequest(f"{field_name} must be a non-empty string")
@@ -160,6 +244,19 @@ def _extract_readings(payload: Mapping[str, object]) -> list:
     if len(readings) > MAX_READINGS:
         raise InvalidRequest(f"field 'readings' may contain at most {MAX_READINGS} values")
     return readings
+
+
+def _extract_timed_readings(payload: Mapping[str, object]) -> list:
+    timed = payload["timedReadings"]
+    if not isinstance(timed, list):
+        raise InvalidRequest("field 'timedReadings' must be a list")
+    if not timed:
+        raise InvalidRequest("field 'timedReadings' must contain at least one entry")
+    if len(timed) > MAX_TIMED_READINGS:
+        raise InvalidRequest(
+            f"field 'timedReadings' may contain at most {MAX_TIMED_READINGS} entries"
+        )
+    return timed
 
 
 @dataclass
@@ -183,13 +280,55 @@ class TranslationResult:
         }
 
 
-def translate(payload: Mapping[str, object]) -> TranslationResult:
+@dataclass
+class TimedItemResult:
+    """One replayed reading: the echoed input plus its moment-specific answer."""
+
+    index: int
+    value: object  # original JSON value, echoed verbatim
+    observed_at: str  # original RFC3339 string, echoed verbatim
+    transform: Affine
+    result: Fraction
+
+    def to_json(self) -> dict:
+        return {
+            "index": self.index,
+            "value": self.value,
+            "observedAt": self.observed_at,
+            "result": render_fraction(self.result),
+            "coefficients": {
+                "a": render_fraction(self.transform.a),
+                "b": render_fraction(self.transform.b),
+            },
+        }
+
+
+@dataclass
+class TimedTranslationResult:
+    source: str
+    target: str
+    items: list[TimedItemResult] = field(default_factory=list)
+
+    def to_json(self) -> dict:
+        return {
+            "source": self.source,
+            "target": self.target,
+            "timedResults": [item.to_json() for item in self.items],
+        }
+
+
+def translate(payload: Mapping[str, object]) -> TranslationResult | TimedTranslationResult:
     """Validate a request and translate readings from source to target.
 
     Raises :class:`InvalidRequest`, :class:`Unreachable` or
     :class:`CalibrationConflict`.  The answer never depends on the order in
     which relations were entered: every edge is checked against every path
     already derived, and a mismatch rejects the whole request.
+
+    With ``timedReadings`` each entry is replayed against the relations in
+    force at its own ``observedAt`` moment; the batch is all-or-nothing, so
+    the first entry without a valid path (or with a conflicting set of
+    active relations) aborts the request with its index and moment attached.
     """
     if not isinstance(payload, Mapping):
         raise InvalidRequest("request body must be a JSON object")
@@ -204,7 +343,13 @@ def translate(payload: Mapping[str, object]) -> TranslationResult:
 
     source = _require_str(payload.get("source"), "field 'source'")
     target = _require_str(payload.get("target"), "field 'target'")
-    raw_readings = _extract_readings(payload)
+
+    has_readings = "readings" in payload
+    has_timed = "timedReadings" in payload
+    if has_readings and has_timed:
+        raise InvalidRequest("fields 'readings' and 'timedReadings' are mutually exclusive")
+    raw_timed = _extract_timed_readings(payload) if has_timed else None
+    raw_readings = None if has_timed else _extract_readings(payload)
 
     relations: list[Relation] = []
     vertices: set[str] = set()
@@ -220,7 +365,13 @@ def translate(payload: Mapping[str, object]) -> TranslationResult:
         if a == 0:
             raise InvalidRequest(f"{where}.a must not be zero")
         b = parse_rational(item.get("b", 0), f"{where}.b")
-        relations.append(Relation(frm, to, a, b))
+        valid_from = None
+        if "validFrom" in item:
+            valid_from = parse_timestamp(item.get("validFrom"), f"{where}.validFrom")
+        valid_until = None
+        if "validUntil" in item:
+            valid_until = parse_timestamp(item.get("validUntil"), f"{where}.validUntil")
+        relations.append(Relation(frm, to, a, b, valid_from, valid_until))
         vertices.add(frm)
         vertices.add(to)
 
@@ -234,6 +385,9 @@ def translate(payload: Mapping[str, object]) -> TranslationResult:
     if target not in vertices:
         raise InvalidRequest(f"target {target!r} does not appear in any relation")
 
+    if raw_timed is not None:
+        return _translate_timed(relations, source, target, raw_timed)
+
     readings = [parse_rational(v, f"readings[{i}]") for i, v in enumerate(raw_readings)]
 
     total = _solve_component(relations, source).get(target)
@@ -242,6 +396,49 @@ def translate(payload: Mapping[str, object]) -> TranslationResult:
 
     results = [total.apply(x) for x in readings]
     return TranslationResult(source, target, total, readings, results)
+
+
+def _translate_timed(
+    relations: list[Relation],
+    source: str,
+    target: str,
+    raw_items: list,
+) -> TimedTranslationResult:
+    """Replay each timed reading against the relations in force at its moment.
+
+    Every entry is validated up front; then entries are solved in input
+    order.  The first entry whose moment has no valid source->target path,
+    or whose active relations contradict each other, fails the whole batch:
+    no partial results are ever returned.
+    """
+    parsed: list[tuple[int, object, str, datetime, Fraction]] = []
+    for index, raw in enumerate(raw_items):
+        where = f"timedReadings[{index}]"
+        if not isinstance(raw, Mapping):
+            raise InvalidRequest(f"{where} must be an object")
+        if "value" not in raw:
+            raise InvalidRequest(f"{where}.value is required")
+        if "observedAt" not in raw:
+            raise InvalidRequest(f"{where}.observedAt is required")
+        observed_raw = raw["observedAt"]
+        moment = parse_timestamp(observed_raw, f"{where}.observedAt")
+        value = parse_rational(raw["value"], f"{where}.value")
+        parsed.append((index, raw["value"], observed_raw, moment, value))
+
+    items: list[TimedItemResult] = []
+    for index, raw_value, observed_raw, moment, value in parsed:
+        active = [rel for rel in relations if rel.is_active_at(moment)]
+        try:
+            transforms = _solve_component(active, source)
+        except CalibrationConflict as exc:
+            exc.index = index
+            exc.observed_at = observed_raw
+            raise
+        total = transforms.get(target)
+        if total is None:
+            raise Unreachable(source, target, index=index, observed_at=observed_raw)
+        items.append(TimedItemResult(index, raw_value, observed_raw, total, total.apply(value)))
+    return TimedTranslationResult(source, target, items)
 
 
 def _solve_component(relations: Iterable[Relation], source: str) -> dict[str, Affine]:

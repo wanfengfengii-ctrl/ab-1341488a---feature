@@ -84,6 +84,11 @@ class CalibrationHandler(BaseHTTPRequestHandler):
             elif exc.code == "unreachable":
                 error["source"] = exc.source  # type: ignore[attr-defined]
                 error["target"] = exc.target  # type: ignore[attr-defined]
+            index = getattr(exc, "index", None)
+            if index is not None:
+                # timed replay failure: locate the offending historical reading
+                error["index"] = index
+                error["observedAt"] = getattr(exc, "observed_at", None)
             self._send_json(exc.status, {"error": error})
             return
         except Exception:  # pragma: no cover - defensive
